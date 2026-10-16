@@ -1,114 +1,83 @@
-import cv2
-from PIL import ImageGrab, Image
-import pyautogui
-from time import sleep
-import pytesseract
-import appscript
-import numpy as np
-import anagram
-from pynput import mouse
+"""Portable rack solver. Mouse guidance is an explicit, macOS-only opt-in."""
+import argparse
+import json
+import platform
+import threading
+try:
+    from .anagram import normalize_rack, find_anagrams, tile_indices
+except ImportError:
+    from anagram import normalize_rack, find_anagrams, tile_indices
 
-
-terminate = False
-
-
-def get_window():
-    app = appscript.app('System Events').application_processes['iPhone Mirroring']
-    position = app.windows[0].position()
-    size = app.windows[0].size()
-    return position, size
-
-
-
-def grab_bottom(position, size):
-    ImageGrab.grab(bbox=(position[0], position[1]+(int(2 * (size[1] / 3))), position[0]+size[0], position[1]+size[1])).save('bottom.png')
-
-def img_process():
-    img = cv2.imread('bottom.png')
-    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-    data = np.array(gray)
-    #set all colors to white but the text to black
-    converted = np.where(data > 10, 255, 0)
-    converted = np.array(converted)
-    img = Image.fromarray(converted.astype('uint8'))
-    img.save('bottom.png')
 
 def create_coords(position, size):
-    coords = []
-    y = .82*size[1]
-    for i in range(12):
-        if i % 2 == 1:
-            coords.append((position[0] + ((i/12) * size[0]), position[1] + y))
-    return coords
-
-def get_letters():
-    text = pytesseract.image_to_string('bottom.png')
-    text.replace(" ", "")
-    if len(text) != 6:
-        print("OCR no work")
-        text = input("type letters for anagrams: ")
-    text = text.upper()
-    return text
-
-def get_combos(text):
-    combos1 = anagram.find_anagrams(text)
-    combos = []
-    #remove duplciate letters
-    [combos.append(x) for x in combos1 if x not in combos]
-    return combos
-
-def map_letters_to_coords(text, coords):
-    map = {}
-    for letter in text:
-        if letter in map:
-            map[letter + letter] = coords.pop(0)
-        else:
-            map[letter] = coords.pop(0)
-    return map
-
-#check if mouse is clicked
-def on_click(x, y, button, pressed):
-    if not pressed:
-        # Stop listener
-        return False
+    return [(position[0]+((2*i+1)/12)*size[0], position[1]+.82*size[1]) for i in range(6)]
 
 
-def move_mouse(map, combo, position, size):
-    letters_entered = []
-    for letter in combo:
-        if letter not in letters_entered:
-            letters_entered.append(letter)
-            pyautogui.moveTo(map[letter])
-        else:
-            letters_entered.append(letter + letter)
-            pyautogui.moveTo(map[letter + letter])
-        #wait until mouse is clicked
-        with mouse.Listener(
-            on_click=on_click) as listener:
-            listener.join()
-    pyautogui.moveTo(position[0] + int(size[0]/2), position[1] + int(size[1]*.6))
-    with mouse.Listener(
-            on_click=on_click) as listener:
-        listener.join()
+def plan_word(rack, word, coordinates):
+    if len(coordinates) != len(normalize_rack(rack)):
+        raise ValueError('One coordinate per rack tile is required')
+    return [coordinates[i] for i in tile_indices(rack, word)]
+
+
+def guide_mouse(rack=None):
+    if platform.system() != 'Darwin':
+        raise RuntimeError('Mouse guidance requires macOS and iPhone Mirroring. Use the web UI or CLI on this platform.')
+    # Optional desktop dependencies are loaded only after explicit opt-in.
+    import appscript
+    import pyautogui
+    from pynput import mouse, keyboard
+    from PIL import ImageGrab
+    import pytesseract
+    app = appscript.app('System Events').application_processes['iPhone Mirroring']
+    position, size = app.windows[0].position(), app.windows[0].size()
+    if rack is None:
+        image = ImageGrab.grab(bbox=(position[0], position[1]+int(size[1]*2/3), position[0]+size[0], position[1]+size[1]))
+        raw = pytesseract.image_to_string(image, config='--psm 7 -c tessedit_char_whitelist=ABCDEFGHIJKLMNOPQRSTUVWXYZ')
+        try: rack = normalize_rack(raw)
+        except ValueError: rack = normalize_rack(input('OCR could not identify tiles. Enter the six letters: '))
+        print('OCR rack:',rack)
+        if input('Confirm these six tiles before guidance (yes/no): ').strip().lower() != 'yes': return
+    if len(rack) != 6 or '?' in rack:
+        raise ValueError('Mouse guidance requires exactly six real letter tiles')
+    stop, released = threading.Event(), threading.Event()
+    def key_press(key):
+        if key == keyboard.Key.esc: stop.set();released.set();return False
+    def click(_x,_y,_button,pressed):
+        if not pressed: released.set()
+    pyautogui.FAILSAFE = True
+    print('Guidance only: you click each tile. Esc cancels before the next movement. Move to a screen corner for the PyAutoGUI fail-safe.')
+    coords = create_coords(position,size)
+    try:
+        with keyboard.Listener(on_press=key_press), mouse.Listener(on_click=click):
+            for word in find_anagrams(rack):
+                if stop.is_set(): break
+                print(word)
+                targets = plan_word(rack,word,coords)+[(position[0]+size[0]/2,position[1]+size[1]*.6)]
+                for target in targets:
+                    if stop.is_set(): break
+                    released.clear()
+                    pyautogui.moveTo(*target,duration=.1)
+                    while not stop.is_set() and not released.wait(.1): pass
+    except KeyboardInterrupt:
+        stop.set()
+
 
 def main():
-    for i in range (3):
-        print(3-i)
-        sleep(1)
-    position, size = get_window()
-    grab_bottom(position, size)
-    img_process()
-    text = get_letters()
-    combos = get_combos(text)
-    print(combos)
-    coords = create_coords(position, size)
-    map = map_letters_to_coords(text, coords)
-    for combo in combos:
-        if terminate:
-            break
-        print(str(combo))
-        move_mouse(map, combo, position, size)
-    print("done")
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('letters',nargs='?')
+    parser.add_argument('--exact',action='store_true')
+    parser.add_argument('--json',action='store_true')
+    parser.add_argument('--guide-mouse',action='store_true')
+    args=parser.parse_args()
+    try:
+        if args.guide_mouse:
+            guide_mouse(normalize_rack(args.letters) if args.letters else None)
+            return
+        if not args.letters: parser.error('Enter rack letters, for example: python Anagrams/main.py STREAM')
+        words=find_anagrams(args.letters,exact=args.exact)
+        print(json.dumps(words) if args.json else '\n'.join(words))
+    except (ValueError, RuntimeError, ImportError) as error:
+        parser.error(str(error))
 
-if __name__ == "__main__":
-    main()    
+
+if __name__ == '__main__': main()

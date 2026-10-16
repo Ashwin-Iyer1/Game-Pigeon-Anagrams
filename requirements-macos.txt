@@ -1,0 +1,5 @@
+appscript>=1.2.5,<2; sys_platform == "darwin"
+pillow>=10.4,<13
+PyAutoGUI>=0.9.54,<1
+pytesseract>=0.3.10,<1
+pynput>=1.7.7,<2
